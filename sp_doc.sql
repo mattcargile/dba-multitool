@@ -52,6 +52,12 @@ IF  EXISTS (SELECT * FROM sys.fn_listextendedproperty(N'@Verbose' , N'SCHEMA',N'
 	END
 GO
 
+IF  EXISTS (SELECT * FROM sys.fn_listextendedproperty(N'@AllExtendedProperties' , N'SCHEMA',N'dbo', N'PROCEDURE',N'sp_doc', NULL,NULL))
+	BEGIN;
+		EXEC sys.sp_dropextendedproperty @name=N'@AllExtendedProperties' , @level0type=N'SCHEMA',@level0name=N'dbo', @level1type=N'PROCEDURE',@level1name=N'sp_doc';
+	END
+GO
+
 /***************************/
 /* Create stored procedure */
 /***************************/
@@ -64,6 +70,7 @@ GO
 ALTER PROCEDURE [dbo].[sp_doc]
 	@DatabaseName SYSNAME = NULL
 	,@ExtendedPropertyName SYSNAME = 'Description'
+	,@AllExtendedProperties BIT = 0
 	,@LimitStoredProcLength BIT = 1
 	,@Emojis BIT = 0
 	,@Verbose BIT = 1
@@ -230,11 +237,12 @@ BEGIN
 	Generate markdown for tables
 	****************************/
 	--Variables
-	+ N'DECLARE @ObjectId INT,
-		@IndexObjectId INT,
-		@TrigObjectId INT,
-		@CheckConstObjectId INT,
-		@DefaultConstObjectId INT;
+	+ N'DECLARE @ObjectId INT
+		,@IndexObjectId INT
+		,@TrigObjectId INT
+		,@CheckConstObjectId INT
+		,@DefaultConstObjectId INT
+		,@EPObjectId INT;
 
 		DECLARE @KeyColumns NVARCHAR(MAX),
 		@IncludeColumns NVARCHAR(MAX);';
@@ -274,7 +282,7 @@ BEGIN
 			INSERT INTO #markdown
 			SELECT CONCAT(CHAR(13), CHAR(10), ''### '', OBJECT_SCHEMA_NAME(@ObjectId), ''.'', OBJECT_NAME(@ObjectId));' +
 
-			--Extended Properties
+			--Table Extended Properties
 			+ N'
 			IF EXISTS (SELECT * FROM [sys].[tables] AS [t] WITH(NOLOCK)
 							INNER JOIN [sys].[extended_properties] AS [ep] WITH(NOLOCK) ON [t].[object_id] = [ep].[major_id]
@@ -283,18 +291,36 @@ BEGIN
 								AND [ep].[name] = @ExtendedPropertyName)
 				BEGIN;
 					INSERT INTO #markdown (value)
-					VALUES (CONCAT(CHAR(13), CHAR(10), ''| Description |''))
-					,(''| --- |'');
+					VALUES (CONCAT(CHAR(13), CHAR(10), ''#### '', ''Table Extended Properties''))
+					,(CONCAT(CHAR(13), CHAR(10), ''| Name | Value |''))
+					,(''| --- | --- |'');
 				END;
 
-			INSERT INTO #markdown
-			SELECT CONCAT(''| '', REPLACE(REPLACE(REPLACE(CAST([ep].[value] AS NVARCHAR(4000)), ''|'', @PipeHTMLCode COLLATE DATABASE_DEFAULT), CHAR(13) + CHAR(10), @BreakHTMLCode COLLATE DATABASE_DEFAULT), ''`'', @TickHTMLCode COLLATE DATABASE_DEFAULT) COLLATE DATABASE_DEFAULT, '' | '')
+			INSERT INTO #markdown (value)
+			SELECT CONCAT(''| '', @ExtendedPropertyName, '' | '', REPLACE(REPLACE(REPLACE(CAST([ep].[value] AS NVARCHAR(4000)), ''|'', @PipeHTMLCode COLLATE DATABASE_DEFAULT), CHAR(13) + CHAR(10), @BreakHTMLCode COLLATE DATABASE_DEFAULT), ''`'', @TickHTMLCode COLLATE DATABASE_DEFAULT) COLLATE DATABASE_DEFAULT, '' |'')
 			FROM [sys].[tables] AS [t] WITH(NOLOCK)
 				INNER JOIN [sys].[extended_properties] AS [ep] WITH(NOLOCK) ON [t].[object_id] = [ep].[major_id]
 			WHERE [t].[object_id] = @ObjectId
 				AND [ep].[minor_id] = 0 --On the table
-				AND [ep].[name] = @ExtendedPropertyName;';
+				AND [ep].[name] = @ExtendedPropertyName';
 
+			IF @AllExtendedProperties = 1
+				BEGIN
+					SET @Sql = @Sql + N'
+					INSERT INTO #markdown (value)
+					SELECT CONCAT(''| '', [ep].[name], '' | '', REPLACE(REPLACE(REPLACE(CAST([ep].[value] AS NVARCHAR(4000)), ''|'', @PipeHTMLCode COLLATE DATABASE_DEFAULT), CHAR(13) + CHAR(10), @BreakHTMLCode COLLATE DATABASE_DEFAULT), ''`'', @TickHTMLCode COLLATE DATABASE_DEFAULT) COLLATE DATABASE_DEFAULT, '' |'')
+					FROM [sys].[tables] AS [t] WITH(NOLOCK)
+						INNER JOIN [sys].[extended_properties] AS [ep] WITH(NOLOCK) ON [t].[object_id] = [ep].[major_id]
+					WHERE [t].[object_id] = @ObjectId
+						AND [ep].[minor_id] = 0 --On the table
+						AND [ep].[name] <> @ExtendedPropertyName
+					ORDER BY [ep].[name] DESC';
+				END
+
+			-- Columns
+			SET @Sql = @Sql + N'
+			INSERT INTO #markdown (value)
+			SELECT CONCAT(CHAR(13), CHAR(10), ''#### '', ''Columns'');';
 
 			IF @SensitivityClassification = 1
 				BEGIN
@@ -311,9 +337,8 @@ BEGIN
 					,(''| --- | --- | --- | --- | --- | --- |'');';
 				END;
 
-			--Columns
 			SET @Sql = @Sql + N'
-			INSERT INTO #markdown
+			INSERT INTO #markdown (value)
 			SELECT CONCAT(''| ''
                     ,CASE
                         WHEN [ic].[object_id] IS NOT NULL
@@ -407,13 +432,44 @@ BEGIN
 				END;
 
 			SET @Sql = @Sql + N'
-			WHERE [t].[object_id] = @ObjectId;' +
+			WHERE [t].[object_id] = @ObjectId;';
+
+			--Column Extended Properties
+			IF @AllExtendedProperties = 1
+				BEGIN
+					SET @Sql = @Sql + N'
+					IF EXISTS (SELECT * FROM [sys].[tables] AS [t] WITH(NOLOCK)
+							INNER JOIN [sys].[extended_properties] AS [ep] WITH(NOLOCK) ON [t].[object_id] = [ep].[major_id]
+							WHERE [t].[object_id] = @ObjectId
+								AND [ep].[minor_id] > 0 --Column, when class = 1
+								AND [ep].[class] = 1 --Object/col
+								AND [ep].[name] <> @ExtendedPropertyName)
+					BEGIN
+						INSERT INTO #markdown (value)
+						VALUES (CONCAT(CHAR(13), CHAR(10), ''#### '', ''Column Extended Properties''))
+						,(CONCAT(CHAR(13), CHAR(10), ''Column | Name | Value |''))
+						,(''| --- | --- | --- |'');
+
+						INSERT INTO #markdown (value)
+						SELECT CONCAT(''| '', [c].[name], '' | '', [ep].[name], '' | '', REPLACE(REPLACE(REPLACE(CAST([ep].[value] AS NVARCHAR(4000)), ''|'', @PipeHTMLCode COLLATE DATABASE_DEFAULT), CHAR(13) + CHAR(10), @BreakHTMLCode COLLATE DATABASE_DEFAULT), ''`'', @TickHTMLCode COLLATE DATABASE_DEFAULT) COLLATE DATABASE_DEFAULT, '' |'')
+						FROM [sys].[tables] AS [t] WITH(NOLOCK)
+							INNER JOIN [sys].[extended_properties] AS [ep] WITH(NOLOCK) ON [t].[object_id] = [ep].[major_id]
+							INNER JOIN [sys].[columns] AS [c] ON [ep].[minor_id] = [c].[column_id]
+								AND [c].[object_id] = [t].[object_id]
+						WHERE [t].[object_id] = @ObjectId
+							AND [ep].[minor_id] > 0 --Column (when class = 1)
+							AND [ep].[class] = 1 --Object/col
+							AND [ep].[name] <> @ExtendedPropertyName
+						ORDER BY [c].[name], [ep].[name] DESC;
+					END;';
+				END
 
 			--Indexes
-			+ N'IF EXISTS (SELECT 1 FROM [sys].[indexes] WHERE [object_id] = @ObjectId AND [type] > 0)
+			SET @Sql = @Sql + N'
+			IF EXISTS (SELECT 1 FROM [sys].[indexes] WHERE [object_id] = @ObjectId AND [type] > 0)
 			BEGIN
 				INSERT INTO #markdown (value)
-				SELECT CONCAT(CHAR(13), CHAR(10), ''#### '', ''Indexes'')
+				SELECT CONCAT(CHAR(13), CHAR(10), ''#### '', ''Indexes'');
 				DECLARE [index_cursor] CURSOR
 				LOCAL STATIC READ_ONLY FORWARD_ONLY
 				FOR
@@ -492,6 +548,8 @@ BEGIN
 				DEALLOCATE [index_cursor];
 			END;
 			' +
+
+			--TODO: Index Extended Properties
 
 			--Triggers
 			+ N'IF EXISTS (SELECT * FROM [sys].[triggers] WHERE [parent_id] = @ObjectId)
@@ -598,7 +656,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10), ''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
+			VALUES (CONCAT(CHAR(13), CHAR(10), ''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId;
 
@@ -838,7 +896,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10), ''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
+			VALUES (CONCAT(CHAR(13), CHAR(10), ''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId;
 
@@ -1013,7 +1071,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10), ''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
+			VALUES (CONCAT(CHAR(13), CHAR(10), ''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId
 
@@ -1172,7 +1230,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10), ''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
+			VALUES (CONCAT(CHAR(13), CHAR(10), ''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId;
 
@@ -1328,7 +1386,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10),''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
+			VALUES (CONCAT(CHAR(13), CHAR(10),''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId;
 
@@ -1461,7 +1519,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10),''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
+			VALUES (CONCAT(CHAR(13), CHAR(10),''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''));
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId
 
@@ -1596,7 +1654,7 @@ BEGIN
 				LEFT JOIN [sys].[extended_properties] AS [ep] ON [tt].[user_type_id] = [ep].[major_id]
 					AND [ep].[minor_id] > 0
 					AND [ep].[minor_id] = [c].[column_id]
-					AND [ep].[class] = 8 --Object/col
+					AND [ep].[class] = 8 -- User defined table type col
 					AND [ep].[name] = @ExtendedPropertyName
 				LEFT JOIN [sys].[foreign_key_columns] AS [fk] ON [fk].[parent_object_id] = [c].[object_id]
 					AND [fk].[parent_column_id] = [c].[column_id]
@@ -1660,7 +1718,7 @@ BEGIN
 
 			--Back to top
 			+ N'INSERT INTO #markdown
-			VALUES (CONCAT(CHAR(13), CHAR(10), ''[Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''))
+			VALUES (CONCAT(CHAR(13), CHAR(10), ''[▲ Back to top](#'', LOWER(@DatabaseName COLLATE DATABASE_DEFAULT), '')''))
 
 			FETCH NEXT FROM obj_cursor INTO @ObjectId;
 
@@ -1737,3 +1795,5 @@ GO
 EXEC sys.sp_addextendedproperty @name=N'@Verbose', @value=N'Whether or not to print additional information during the script run. Default is 0.' , @level0type=N'SCHEMA',@level0name=N'dbo', @level1type=N'PROCEDURE',@level1name=N'sp_doc';
 GO
 
+EXEC sys.sp_addextendedproperty @name=N'@AllExtendedProperties', @value=N' Include all extended properties for each object, not just @ExtendedPropertyName. Default is 0.' , @level0type=N'SCHEMA',@level0name=N'dbo', @level1type=N'PROCEDURE',@level1name=N'sp_doc';
+GO
